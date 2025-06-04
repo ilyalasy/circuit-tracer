@@ -4,7 +4,8 @@ import gzip
 import http.server
 import json
 import logging
-import os
+import os   
+import sys
 import socketserver
 import threading
 from importlib.resources import files
@@ -90,22 +91,162 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 return
 
+            # Get file size for large file detection
+            file_size = os.path.getsize(local_path)
+            
+            # Check for Range header (HTTP Range Requests)
+            range_header = self.headers.get('Range')
+            if range_header and file_size > 100 * 1024**2:  # Support ranges for files > 100MB
+                logger.info(f"Range request for {local_path}: {range_header}")
+                self._handle_range_request(local_path, file_size, range_header)
+                return
+            
             self.send_response(200)
-            with open(local_path, "rb") as f:
-                content = f.read()
-
-            # Compress large responses
-            if len(content) > 1024**2:  # 1MB threshold
-                content = gzip.compress(content, compresslevel=3)
-                self.send_header("Content-Encoding", "gzip")
-
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(content))
-            self.end_headers()
-            self.wfile.write(content)
+            
+            # For very large files (>500MB), suggest Range requests
+            if file_size > 500 * 1024**2:
+                self.send_header("Accept-Ranges", "bytes")
+                logger.warning(f"Large file {local_path} ({file_size / 1024**2:.2f} MB) - consider using Range requests")
+            
+            # For large files, use chunked transfer encoding with streaming compression
+            if file_size > 10 * 1024**2:  # 10MB threshold for streaming
+                logger.info(f"Streaming large file {local_path} ({file_size / 1024**2:.2f} MB)")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                
+                # Stream compressed data in chunks
+                chunk_size = 64 * 1024  # 64KB chunks
+                compressor = gzip.GzipFile(fileobj=self.wfile, mode='wb', compresslevel=3)
+                
+                try:
+                    with open(local_path, "rb") as f:
+                        total_read = 0
+                        while True:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            
+                            # Check if client is still connected before writing
+                            try:
+                                compressor.write(chunk)
+                                # Force a small flush to detect broken pipes earlier
+                                if total_read % (10 * 1024**2) == 0:  # Every 10MB
+                                    compressor.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                                logger.info(f"Client disconnected after {total_read / 1024**2:.1f} MB: {e}")
+                                break
+                                
+                            total_read += len(chunk)
+                            
+                            # Log progress for very large files
+                            if total_read % (50 * 1024**2) == 0:  # Every 50MB
+                                logger.info(f"Streamed {total_read / 1024**2:.1f} MB of {file_size / 1024**2:.1f} MB")
+                    
+                    compressor.close()
+                    logger.info(f"Successfully streamed {local_path} ({total_read / 1024**2:.1f} MB)")
+                    
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    logger.info(f"Client disconnected during streaming: {e}")
+                    try:
+                        compressor.close()
+                    except:
+                        pass
+                except Exception as e:
+                    logger.error(f"Error streaming file: {e}")
+                    try:
+                        compressor.close()
+                    except:
+                        pass
+                    
+            else:
+                # For smaller files, use the original approach
+                with open(local_path, "rb") as f:
+                    content = f.read()
+
+                # Compress responses over 1MB
+                if len(content) > 1024**2:  # 1MB threshold
+                    content = gzip.compress(content, compresslevel=3)
+                    logger.info(f"Compressed {local_path} to {len(content) / 1024**2:.2f} MB")
+                    self.send_header("Content-Encoding", "gzip")
+
+                self.send_header("Content-Length", len(content))
+                self.end_headers()
+                self.wfile.write(content)
+            
             return
 
         super().do_GET()
+
+    def _handle_range_request(self, local_path, file_size, range_header):
+        """Handle HTTP Range requests for large files."""
+        try:
+            # Parse Range header (e.g., "bytes=0-1023" or "bytes=1024-")
+            if not range_header.startswith('bytes='):
+                self.send_response(400)
+                self.end_headers()
+                return
+                
+            range_spec = range_header[6:]  # Remove "bytes="
+            
+            if '-' not in range_spec:
+                self.send_response(400)
+                self.end_headers()
+                return
+                
+            start_str, end_str = range_spec.split('-', 1)
+            
+            # Parse start and end positions
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+            
+            # Validate range
+            if start < 0 or start >= file_size or end >= file_size or start > end:
+                self.send_response(416)  # Range Not Satisfiable
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+                
+            content_length = end - start + 1
+            
+            logger.info(f"Serving range {start}-{end} ({content_length / 1024**2:.2f} MB) of {local_path}")
+            
+            self.send_response(206)  # Partial Content
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Accept-Ranges", "bytes")
+            
+            # For range requests, don't compress (keeps it simple and predictable)
+            self.end_headers()
+            
+            # Stream the requested range
+            chunk_size = 64 * 1024  # 64KB chunks
+            with open(local_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    chunk = f.read(read_size)
+                    if not chunk:
+                        break
+                        
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        logger.info(f"Client disconnected during range request: {e}")
+                        break
+                        
+                    remaining -= len(chunk)
+                    
+            logger.info(f"Range request completed for {local_path}")
+            
+        except Exception as e:
+            logger.error(f"Error handling range request: {e}")
+            self.send_response(500)
+            self.end_headers()
 
     def do_POST(self):
         if not self.path.startswith("/save_graph/"):
@@ -154,10 +295,20 @@ class Server:
 
         # Add a handler to logger that records to self.logs
         self.log_handler = ListHandler(self.logs)
-        self.log_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        )
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        self.log_handler.setFormatter(formatter)
         logger.addHandler(self.log_handler)
+
+        # Add a FileHandler to write logs to a file
+        self.file_handler = logging.FileHandler("server.log")
+        self.file_handler.setFormatter(formatter)
+        logger.addHandler(self.file_handler)
+
+        # Add a StreamHandler to write logs to the terminal
+        self.stream_handler = logging.StreamHandler(sys.stdout)
+        self.stream_handler.setFormatter(formatter)
+        logger.addHandler(self.stream_handler)
+
         logger.setLevel(logging.INFO)
         # Register shutdown with atexit
         atexit.register(self.stop)
@@ -195,6 +346,8 @@ class Server:
 
         # Remove our handler when the server stops
         logger.removeHandler(self.log_handler)
+        logger.removeHandler(self.file_handler)
+        logger.removeHandler(self.stream_handler)
 
         # Unregister from atexit to avoid duplicate calls
         atexit.unregister(self.stop)

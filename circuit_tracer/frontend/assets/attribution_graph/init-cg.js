@@ -1,6 +1,123 @@
 window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold} = {}){
   var data = await util.getFile(`./graph_data/${slug}.json`)
   
+  // Show loading status if this is partial data
+  if (data._partial) {
+    const statusDiv = sel.append('div.loading-status')
+      .style('padding', '10px')
+      .style('background', '#f0f0f0')
+      .style('border-radius', '5px')
+      .style('margin-bottom', '10px')
+    
+    statusDiv.append('div')
+      .style('font-weight', 'bold')
+      .text(`Loaded ${data._loadedNodes.toLocaleString()} most influential nodes out of ${data._totalNodes.toLocaleString()} total`)
+    
+    statusDiv.append('div')
+      .style('font-size', '12px')
+      .style('color', '#666')
+      .text(`${data._loadedLinks.toLocaleString()} links displayed. This prevents browser crashes with large graphs.`)
+    
+    // Show influence threshold
+    if (data.nodes.length > 0) {
+      const minInfluence = Math.min(...data.nodes.map(n => n.influence || 0))
+      statusDiv.append('div')
+        .style('font-size', '12px')
+        .style('color', '#666')
+        .style('margin-top', '5px')
+        .text(`Showing nodes with influence ≥ ${minInfluence.toFixed(4)}`)
+    }
+    
+    const buttonContainer = statusDiv.append('div')
+      .style('margin-top', '10px')
+    
+    // Store reference for re-rendering
+    window._cgReRender = null
+    
+    buttonContainer.append('button')
+      .text('Load 2000 more nodes')
+      .style('margin-right', '10px')
+      .style('padding', '5px 10px')
+      .style('background', '#007cba')
+      .style('color', 'white')
+      .style('border', 'none')
+      .style('border-radius', '3px')
+      .style('cursor', 'pointer')
+      .on('click', async function() {
+        this.disabled = true
+        this.textContent = 'Loading...'
+        
+        try {
+          const moreNodes = await util.loadMoreNodes(slug, data._loadedNodes, 2000)
+          
+          // Add new nodes to existing data
+          data.nodes.push(...moreNodes)
+          data._loadedNodes += moreNodes.length
+          
+          // Update the display
+          statusDiv.select('div').text(`Loaded ${data._loadedNodes.toLocaleString()} most influential nodes out of ${data._totalNodes.toLocaleString()} total`)
+          
+          // Update influence threshold display
+          if (data.nodes.length > 0) {
+            const minInfluence = Math.min(...data.nodes.map(n => n.influence || 0))
+            statusDiv.selectAll('div').filter((d, i) => i === 2)
+              .text(`Showing nodes with influence ≥ ${minInfluence.toFixed(4)}`)
+          }
+          
+          // Reformat data and re-render if possible
+          if (window._cgReRender) {
+            data = await utilCg.formatData(data, visState)
+            window._cgReRender()
+          }
+          
+          this.disabled = false
+          this.textContent = 'Load 2000 more nodes'
+          
+        } catch (error) {
+          console.error('Error loading more nodes:', error)
+          this.textContent = 'Error loading'
+        }
+      })
+    
+    if (data._loadedNodes < data._totalNodes) {
+      buttonContainer.append('button')
+        .text('Load all remaining nodes (may be slow)')
+        .style('padding', '5px 10px')
+        .style('background', '#dc3545')
+        .style('color', 'white')
+        .style('border', 'none')
+        .style('border-radius', '3px')
+        .style('cursor', 'pointer')
+        .on('click', async function() {
+          if (!confirm('Loading all nodes may cause browser performance issues. Continue?')) return
+          
+          this.disabled = true
+          this.textContent = 'Loading all nodes...'
+          
+          try {
+            const remainingNodes = await util.loadMoreNodes(slug, data._loadedNodes, data._totalNodes - data._loadedNodes)
+            
+            data.nodes.push(...remainingNodes)
+            data._loadedNodes = data._totalNodes
+            data._partial = false
+            
+            statusDiv.select('div').text(`All ${data._totalNodes.toLocaleString()} nodes loaded`)
+            buttonContainer.remove()
+            
+            // Reformat data and re-render if possible
+            if (window._cgReRender) {
+              data = await utilCg.formatData(data, visState)
+              window._cgReRender()
+            }
+            
+          } catch (error) {
+            console.error('Error loading all nodes:', error)
+            this.textContent = 'Error loading all'
+          }
+        })
+    }
+  }
+  
   var visState = {
     pinnedIds: [],
     hiddenIds: [],
@@ -58,6 +175,13 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
   data = await utilCg.formatData(data, visState)
   
   var renderAll = util.initRenderAll(['hClerpUpdate', 'clickedId', 'hiddenIds', 'pinnedIds', 'linkType', 'isShowAllLinks', 'features', 'isSyncEnabled', 'shouldSortByWeight', 'hoveredId'])
+
+  // Set up re-render function for progressive loading
+  window._cgReRender = () => {
+    colorNodes()
+    colorLinks()
+    Object.values(renderAll).forEach(fn => fn())
+  }
 
   function colorNodes() {
     data.nodes.forEach(d => d.nodeColor = '#fff')
