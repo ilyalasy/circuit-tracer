@@ -5,10 +5,14 @@ import http.server
 import json
 import logging
 import os
+import sys
 import socketserver
 import threading
 from importlib.resources import files
 from pathlib import Path
+import uvicorn
+from circuit_tracer.frontend.graphql_server import create_graphql_app
+import circuit_tracer.frontend.db as db
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -63,46 +67,34 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             with open(os.path.join(self.directory, "index.html"), "rb") as f:
-                self.wfile.write(
-                    f.read().replace(
-                        b"window.isLocalServing = false;", b"window.isLocalServing = true;"
-                    )
+                content = f.read()
+                # Enable local serving mode
+                content = content.replace(
+                    b"window.isLocalServing = false;", 
+                    b"window.isLocalServing = true;"
                 )
+                self.wfile.write(content)
             return
 
-        # Handle data and graph_data requests from local storage
-        if self.path.startswith(("/data/", "/graph_data/")):
-            # Extract the file path from the URL
-            if self.path.startswith("/data/"):
-                rel_path = self.path[len("/data/") :].split("?")[0]
-            else:  # /graph_data/
-                rel_path = self.path[len("/graph_data/") :].split("?")[0]
-
-            # Properly join paths to handle missing slashes
-            local_path = os.path.join(self.data_dir, rel_path)
-
-            logger.info(
-                f"Rewritten path to {local_path}. "
-                f"(self.path: {self.path}; self.data_dir: {self.data_dir})"
-            )
-            if not os.path.exists(local_path):
-                self.send_response(404)
-                self.end_headers()
-                return
-
-            self.send_response(200)
-            with open(local_path, "rb") as f:
-                content = f.read()
-
-            # Compress large responses
-            if len(content) > 1024**2:  # 1MB threshold
-                content = gzip.compress(content, compresslevel=3)
-                self.send_header("Content-Encoding", "gzip")
-
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(content))
+        # Handle legacy data requests - now redirect to GraphQL metadata
+        if self.path.startswith("/data/graph-metadata.json"):
+            logger.info("Redirecting metadata request to GraphQL")
+            self.send_response(302)
+            self.send_header("Location", "/graphql?query={graphMetadata{slug,scan,transcoderList,promptTokens,prompt,nodeThreshold}}")
             self.end_headers()
-            self.wfile.write(content)
+            return
+
+        # Handle legacy graph_data requests - these should now use GraphQL
+        if self.path.startswith("/graph_data/"):
+            logger.info("Legacy graph data request - client should use GraphQL")
+            self.send_response(410)  # Gone - resource no longer available
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            error_msg = {
+                "error": "Graph data now served via GraphQL. Use /graphql endpoint instead.",
+                "migration_info": "Frontend should use GraphQL queries for nodes and links data."
+            }
+            self.wfile.write(json.dumps(error_msg).encode())
             return
 
         super().do_GET()
@@ -146,9 +138,10 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class Server:
-    def __init__(self, httpd, server_thread):
+    def __init__(self, httpd, server_thread, graphql_server=None):
         self.httpd = httpd
         self.server_thread = server_thread
+        self.graphql_server = graphql_server
         self.logs = []
         self._stopped = False  # Initialize the flag here
 
@@ -157,7 +150,7 @@ class Server:
         self.log_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         )
-        logger.addHandler(self.log_handler)
+        logger.addHandler(self.log_handler)        
         logger.setLevel(logging.INFO)
         # Register shutdown with atexit
         atexit.register(self.stop)
@@ -185,6 +178,13 @@ class Server:
         shutdown_thread.join(timeout=5)
         self.server_thread.join(timeout=5)
 
+        # Stop GraphQL server if running
+        if self.graphql_server:
+            try:
+                self.graphql_server.should_exit = True
+            except Exception as e:
+                logger.debug(f"Error stopping GraphQL server: {e}")
+
         # Force socket close regardless of shutdown success
         try:
             self.httpd.server_close()
@@ -204,17 +204,19 @@ class Server:
         return self.logs
 
 
-def serve(data_dir, frontend_dir=None, port=8032):
+def serve(data_dir, frontend_dir=None, port=8032, use_graphql=True):
     """Start a local HTTP server in a separate thread.
 
     Args:
         data_dir: Directory for local graph data.
         frontend_dir: Directory containing frontend files. Defaults to DEFAULT_FRONTEND_DIR.
         port: Port to serve on. Defaults to 8032.
+        use_graphql: Whether to use the new GraphQL server. Defaults to True.
 
     Returns:
         Server object with a stop() method to shut down the server.
     """
+    logger.addHandler(logging.StreamHandler(sys.stdout))
 
     # Use provided directories or defaults
     frontend_dir = Path(frontend_dir).resolve() if frontend_dir else DEFAULT_FRONTEND_DIR
@@ -225,17 +227,70 @@ def serve(data_dir, frontend_dir=None, port=8032):
 
     logger.info(f"Serving files from: {frontend_dir}")
 
-    # Create a partially applied handler class with configured directories
-    handler = functools.partial(CircuitGraphHandler, frontend_dir=frontend_dir, data_dir=data_dir)
+    if use_graphql:
+        logger.info("Starting GraphQL server mode")
+        # Create GraphQL FastAPI app
+        app = create_graphql_app(data_dir, str(frontend_dir))
+        
+        # Run with uvicorn in a thread
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+        graphql_server = uvicorn.Server(config)
+        
+        server_thread = threading.Thread(target=graphql_server.run, daemon=True)
+        server_thread.start()
+        
+        logger.info(f"GraphQL server serving at http://localhost:{port}")
+        logger.info(f"GraphQL endpoint: http://localhost:{port}/graphql")
+        logger.info(f"Serving files from: {frontend_dir}")
+        logger.info(f"Serving data from: {data_dir}")
+        
+        # Create a dummy httpd for compatibility
+        class DummyHttpd:
+            def shutdown(self):
+                pass
+            def server_close(self):
+                pass
+            @property
+            def socket(self):
+                class DummySocket:
+                    def close(self):
+                        pass
+                return DummySocket()
+        
+        return Server(DummyHttpd(), server_thread, graphql_server)
+    
+    else:
+        # Legacy mode - original HTTP server
+        logger.info("Starting legacy HTTP server mode")
+        # Create a partially applied handler class with configured directories
+        handler = functools.partial(CircuitGraphHandler, frontend_dir=frontend_dir, data_dir=data_dir)
 
-    httpd = ReusableTCPServer(("", port), handler)
+        httpd = ReusableTCPServer(("", port), handler)
 
-    # Start the server in a thread
-    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    server_thread.start()
+        # Start the server in a thread
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
 
-    logger.info(f"Serving at http://localhost:{port}")
-    logger.info(f"Serving files from: {frontend_dir}")
-    logger.info(f"Serving data from: {data_dir}")
+        logger.info(f"Serving at http://localhost:{port}")
+        logger.info(f"Serving files from: {frontend_dir}")
+        logger.info(f"Serving data from: {data_dir}")
 
-    return Server(httpd, server_thread)
+        return Server(httpd, server_thread)
+
+
+def main():
+    # ... existing code ...
+    conn = db.get_db_connection()
+    db.init_db(conn)
+    # Import all graph JSONs in data_dir if not already present
+    data_dir = os.environ.get('GRAPH_DATA_DIR', '../../graphs')
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(os.path.dirname(__file__), data_dir)
+    print(f"Importing graphs from {data_dir}")
+    if os.path.exists(data_dir):
+        db.import_all_graphs_in_dir(conn, data_dir)
+        print("Imported all graphs")
+
+
+if __name__ == "__main__":
+    main()

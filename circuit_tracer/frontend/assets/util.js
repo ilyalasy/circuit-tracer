@@ -42,6 +42,29 @@ window.util = (function () {
     // Cache storage 
     var __datacache = window.__datacache = window.__datacache || {}
 
+    // Use GraphQL for supported paths when enabled
+    if (window.useGraphQL && window.GraphQLClient) {
+      if (path === './data/graph-metadata.json') {
+        console.log('Using GraphQL for metadata');
+        if (!useCache || !__datacache[path]) {
+          __datacache[path] = window.GraphQLClient.getGraphMetadata();
+        }
+        return __datacache[path];
+      }
+      
+      // Handle graph data requests via GraphQL
+      if (path.startsWith('./graph_data/') && path.endsWith('.json')) {
+        const slug = path.replace('./graph_data/', '').replace('.json', '');
+        console.log(`Using GraphQL for graph data: ${slug}`);
+        if (!useCache || !__datacache[path]) {
+          // Check if we have pruning threshold from URL params or visState
+          const pruningThreshold = window.visState?.pruningThreshold || util.params.get('pruningThreshold');
+          __datacache[path] = window.GraphQLClient.loadGraphData(slug, { pruningThreshold });
+        }
+        return __datacache[path];
+      }
+    }
+
     if (path.startsWith('./features/')) {
       path = path.replace('./features/', 'https://d1fk9w8oratjix.cloudfront.net/features/')
     }

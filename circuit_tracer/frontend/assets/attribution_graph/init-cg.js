@@ -1,6 +1,96 @@
+async function loadGraphDataRecursive(slug, {maxNodes = 1000, topKLinks = 10, pruningThreshold = null} = {}) {
+  // 1. Load all logit and embedding nodes
+  let logitNodes = await window.GraphQLClient.getNodes(slug, {
+    featureTypeFilter: 'logit',
+    limit: 1000,
+    sortByInfluence: true
+  });
+  let embeddingNodes = await window.GraphQLClient.getNodes(slug, {
+    featureTypeFilter: 'embedding',
+    limit: 1000,
+    sortByInfluence: true
+  });
+  let allNodesArr = [...(logitNodes.nodes || []), ...(embeddingNodes.nodes || [])];
+  let nodeMap = new Map();
+  console.log(allNodesArr)
+  allNodesArr.forEach(n => nodeMap.set(n.node_id, n));
+  console.log(nodeMap)
+  let frontier = allNodesArr.map(n => n.node_id);
+  let visited = new Set(frontier);
+  let allLinks = [];
+
+  // 2. Recursively expand top links from the frontier
+  while (nodeMap.size < maxNodes && frontier.length > 0) {
+    // For all nodes in the current frontier, fetch their top outgoing links
+    let newNodeIds = [];
+    let batchLinks = [];
+    // Batch link requests for all nodes in the frontier
+    let linkPromises = frontier.map(nodeId =>
+      window.GraphQLClient.getLinks(slug, {
+        sourceFilter: nodeId,
+        limit: topKLinks,
+        weightMin: pruningThreshold,
+        // Sort by abs(weight) descending is default
+      })
+    );
+    let linkResults = await Promise.all(linkPromises);
+    linkResults.forEach(res => {
+      if (res && res.links) {
+        res.links.forEach(link => {
+          batchLinks.push(link);
+          if (!visited.has(link.target)) {
+            newNodeIds.push(link.target);
+            visited.add(link.target);
+          }
+        });
+      }
+    });
+    allLinks.push(...batchLinks);
+    // If we already have enough nodes, break
+    if (nodeMap.size + newNodeIds.length > maxNodes) {
+      newNodeIds = newNodeIds.slice(0, maxNodes - nodeMap.size);
+    }
+    if (newNodeIds.length === 0) break;
+    // Fetch new nodes in batch
+    console.log(newNodeIds)
+    let newNodesRes = await window.GraphQLClient.getNodesByIds(slug, {nodeIds: newNodeIds});    
+    console.log(newNodesRes);
+    (newNodesRes.nodes || []).forEach(n => nodeMap.set(n.node_id, n));
+    // Next frontier: only those nodes we just added
+    frontier = newNodeIds;
+  }
+
+  // 3. Assemble the data object in the same format as before
+  // Also, fetch basicInfo for metadata/qParams
+  let basicInfo = await window.GraphQLClient.getGraphBasicInfo(slug);
+  let data = {
+    metadata: {
+      slug: basicInfo.metadata.slug,
+      scan: basicInfo.metadata.scan,
+      transcoder_list: basicInfo.metadata.transcoder_list || [],
+      prompt_tokens: basicInfo.metadata.prompt_tokens || [],
+      prompt: basicInfo.metadata.prompt,
+      node_threshold: basicInfo.metadata.node_threshold
+    },
+    qParams: {
+      pinned_ids: basicInfo.qParams.pinned_ids || [],
+      supernodes: basicInfo.qParams.supernodes || [],
+      link_type: basicInfo.qParams.link_type || "both",
+      clicked_id: basicInfo.qParams.clicked_id || "",
+      sg_pos: basicInfo.qParams.sgPos || ""
+    },
+    nodes: Array.from(nodeMap.values()),
+    links: allLinks.filter(l => nodeMap.has(l.source) && nodeMap.has(l.target))
+  };
+  return data;
+}
+
 window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold} = {}){
-  var data = await util.getFile(`./graph_data/${slug}.json`)
+  var data = await loadGraphDataRecursive(slug, {maxNodes: 1000, topKLinks: 10, pruningThreshold});
+
+  // var data = await util.getFile(`./graph_data/${slug}.json`)
   
+  console.log(data)
   var visState = {
     pinnedIds: [],
     hiddenIds: [],

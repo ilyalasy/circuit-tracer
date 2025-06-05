@@ -23,6 +23,7 @@
 <script src='./feature_examples/init-feature-examples.js'></script>
 
 <script src='./util.js'></script>
+<script src='./graphql-client.js'></script>
 <script src='./attribution_graph/util-cg.js'></script>
 <script src='./attribution_graph/render-act-histogram.js'></script>
 <script src='./attribution_graph/gridsnap/init-gridsnap.js'></script>
@@ -38,6 +39,23 @@
 <script>
 window.init = async function(){
   window.isLocalServing = false;
+  
+  // Auto-detect GraphQL availability
+  window.useGraphQL = false;
+  try {
+    const response = await fetch('/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '{ __typename }' }) // Introspection query
+    });
+    if (response.ok) {
+      window.useGraphQL = true;
+      console.log('GraphQL server detected - using dynamic loading');
+    }
+  } catch (error) {
+    console.log('GraphQL not available - using traditional file loading');
+  }
+  
   var {graphs} = await util.getFile('./data/graph-metadata.json', false)
 
   window.visState = window.visState || {
