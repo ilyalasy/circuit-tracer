@@ -85,6 +85,369 @@ window.util = (function () {
     }
   }
   
+  // NEW: Chunked graph data loader that doesn't load everything into memory
+  async function getGraphDataStreaming(path, onProgress) {
+    // For backwards compatibility, if no chunked API available, fallback to old method
+    if (!window.isLocalServing) {
+      return getFile(path, false)
+    }
+    
+    console.log('Loading graph metadata first:', path)
+    
+    // First, load only metadata to understand the graph size
+    const metadataResponse = await fetch(`${path}?chunk=metadata`)
+    const metadata = await metadataResponse.json()
+    
+    console.log(`Graph has ${metadata.node_count} nodes and ${metadata.link_count} links`)
+    
+    // Return a special object that implements chunked loading
+    return new ChunkedGraphLoader(path, metadata)
+  }
+  
+  // NEW: Chunked graph loader that fetches data on demand
+  class ChunkedGraphLoader {
+    constructor(basePath, metadata) {
+      this.basePath = basePath
+      this.metadata = metadata.metadata
+      this.qParams = metadata.qParams
+      this.nodeCount = metadata.node_count
+      this.linkCount = metadata.link_count
+      this._loadedNodes = new Map()
+      this._loadedLinks = new Map()
+      
+      console.log(`ChunkedGraphLoader initialized for ${metadata.node_count} nodes, ${metadata.link_count} links`)
+    }
+    
+    // Load initial chunk of nodes (top by influence)
+    async loadInitialNodes(limit = 1000, sortBy = 'influence') {
+      console.log(`Loading initial ${limit} nodes sorted by ${sortBy}`)
+      
+      const response = await fetch(`${this.basePath}?chunk=nodes&limit=${limit}&sort_by=${sortBy}&offset=0`)
+      const data = await response.json()
+      
+      // Store loaded nodes
+      data.nodes.forEach(node => this._loadedNodes.set(node.node_id, node))
+      
+      console.log(`Loaded ${data.nodes.length} initial nodes`)
+      return data.nodes
+    }
+    
+    // Load links for currently loaded nodes
+    async loadLinksForNodes(nodeIds, limit = 2000) {
+      console.log(`Loading links for ${nodeIds.length} nodes`)
+      
+      const nodeIdsParam = Array.from(nodeIds).join(',')
+      const response = await fetch(`${this.basePath}?chunk=links&node_ids=${nodeIdsParam}&limit=${limit}`)
+      const data = await response.json()
+      
+      // Store loaded links
+      data.links.forEach(link => {
+        const linkId = `${link.source}-${link.target}`
+        this._loadedLinks.set(linkId, link)
+      })
+      
+      console.log(`Loaded ${data.links.length} links`)
+      return data.links
+    }
+    
+    // Load neighborhood for a specific node
+    async loadNodeNeighborhood(nodeId, maxLinks = 20) {
+      console.log(`Loading neighborhood for node ${nodeId}`)
+      
+      const response = await fetch(`${this.basePath}?chunk=neighborhood&node_id=${nodeId}&max_links=${maxLinks}`)
+      const data = await response.json()
+      
+      // Store new nodes and links
+      data.nodes.forEach(node => this._loadedNodes.set(node.node_id, node))
+      data.links.forEach(link => {
+        const linkId = `${link.source}-${link.target}`
+        this._loadedLinks.set(linkId, link)
+      })
+      
+      console.log(`Loaded neighborhood: ${data.nodes.length} nodes, ${data.links.length} links`)
+      
+      return {
+        nodes: Array.from(this._loadedNodes.values()),
+        links: Array.from(this._loadedLinks.values()),
+        metadata: this.metadata,
+        qParams: this.qParams,
+        _isOptimized: true,
+        _originalCounts: { nodes: this.nodeCount, links: this.linkCount }
+      }
+    }
+    
+    // Get current loaded data
+    getCurrentData() {
+      return {
+        nodes: Array.from(this._loadedNodes.values()),
+        links: Array.from(this._loadedLinks.values()),
+        metadata: this.metadata,
+        qParams: this.qParams,
+        _isOptimized: true,
+        _originalCounts: { nodes: this.nodeCount, links: this.linkCount }
+      }
+    }
+  }
+
+  // NEW: Clear cached graph data to free memory
+  function clearGraphCache(slug) {
+    if (slug) {
+      const cacheKey = `graph_${slug}`
+      localStorage.removeItem(cacheKey)
+      console.log('Cleared cache for:', slug)
+    } else {
+      // Clear all graph caches
+      const keys = Object.keys(localStorage).filter(key => key.startsWith('graph_'))
+      keys.forEach(key => localStorage.removeItem(key))
+      console.log('Cleared all graph caches:', keys.length)
+    }
+  }
+
+  // NEW: Chunked graph data manager
+  class ChunkedGraphData {
+    constructor(data) {
+      this.metadata = data.metadata
+      this.qParams = data.qParams
+      this._allNodes = data.nodes
+      this._allLinks = data.links
+      this._loadedNodeIds = new Set()
+      this._loadedNodes = []
+      this._loadedLinks = []
+      
+      // Create indexes for efficient lookup
+      this._nodeIndex = new Map(data.nodes.map(n => [n.node_id, n]))
+      this._linksBySource = new Map()
+      this._linksByTarget = new Map()
+      
+      // Build link indexes
+      data.links.forEach(link => {
+        if (!this._linksBySource.has(link.source)) this._linksBySource.set(link.source, [])
+        if (!this._linksByTarget.has(link.target)) this._linksByTarget.set(link.target, [])
+        this._linksBySource.get(link.source).push(link)
+        this._linksByTarget.get(link.target).push(link)
+      })
+      
+      console.log(`ChunkedGraphData initialized: ${data.nodes.length} nodes, ${data.links.length} links indexed`)
+    }
+    
+    // Load initial chunk optimized for display
+    loadInitialChunk(maxNodes = 1000, maxLinks = 2000, sortBy = 'influence', clickedNodeId = null) {
+      console.log('Loading initial chunk...')
+      
+      // Sort all nodes by influence but only load top ones
+      const sortedNodes = this._allNodes.slice().sort((a, b) => {
+        const aVal = Math.abs(a[sortBy] || a.activation || 0)
+        const bVal = Math.abs(b[sortBy] || b.activation || 0)
+        return bVal - aVal
+      })
+      
+      // Find critical nodes that must be included
+      const criticalNodes = sortedNodes.filter(n => 
+        n.feature_type === 'logit' || 
+        n.feature_type === 'embedding' ||
+        (clickedNodeId && n.jsNodeId === clickedNodeId)
+      )
+      
+      // Get top nodes, ensuring critical nodes are included
+      const remainingSlots = maxNodes - criticalNodes.length
+      const otherTopNodes = sortedNodes
+        .filter(n => !criticalNodes.includes(n))
+        .slice(0, Math.max(0, remainingSlots))
+      
+      const selectedNodes = [...criticalNodes, ...otherTopNodes]
+      this._loadChunk(selectedNodes, maxLinks)
+      
+      console.log(`Initial chunk loaded: ${this._loadedNodes.length} nodes, ${this._loadedLinks.length} links`)
+      
+      return {
+        nodes: this._loadedNodes,
+        links: this._loadedLinks,
+        metadata: this.metadata,
+        qParams: this.qParams,
+        _isOptimized: true,
+        _originalCounts: { nodes: this._allNodes.length, links: this._allLinks.length }
+      }
+    }
+    
+    // Load neighborhood around a specific node
+    loadNodeNeighborhood(nodeId, maxLinksPerDirection = 20) {
+      console.log(`Loading neighborhood for node ${nodeId}...`)
+      
+      const incomingLinks = (this._linksByTarget.get(nodeId) || [])
+        .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
+        .slice(0, maxLinksPerDirection)
+      
+      const outgoingLinks = (this._linksBySource.get(nodeId) || [])
+        .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
+        .slice(0, maxLinksPerDirection)
+      
+      // Collect all connected node IDs
+      const connectedNodeIds = new Set([nodeId])
+      ;[...incomingLinks, ...outgoingLinks].forEach(link => {
+        connectedNodeIds.add(link.source)
+        connectedNodeIds.add(link.target)
+      })
+      
+      // Load nodes that aren't already loaded
+      const newNodes = Array.from(connectedNodeIds)
+        .filter(id => !this._loadedNodeIds.has(id))
+        .map(id => this._nodeIndex.get(id))
+        .filter(Boolean)
+      
+      // Add new nodes and links to loaded data
+      this._loadedNodes.push(...newNodes)
+      newNodes.forEach(n => this._loadedNodeIds.add(n.node_id))
+      
+      const newLinks = [...incomingLinks, ...outgoingLinks]
+        .filter(link => 
+          this._loadedNodeIds.has(link.source) && 
+          this._loadedNodeIds.has(link.target) &&
+          !this._loadedLinks.some(l => l.source === link.source && l.target === link.target)
+        )
+      
+      this._loadedLinks.push(...newLinks)
+      
+      console.log(`Neighborhood loaded: +${newNodes.length} nodes, +${newLinks.length} links`)
+      
+      return {
+        nodes: this._loadedNodes,
+        links: this._loadedLinks,
+        metadata: this.metadata,
+        qParams: this.qParams,
+        _isOptimized: true,
+        _originalCounts: { nodes: this._allNodes.length, links: this._allLinks.length }
+      }
+    }
+    
+    // Internal method to load a chunk of nodes and their connecting links
+    _loadChunk(nodes, maxLinks = 2000) {
+      // Add nodes to loaded set
+      nodes.forEach(n => {
+        if (!this._loadedNodeIds.has(n.node_id)) {
+          this._loadedNodes.push(n)
+          this._loadedNodeIds.add(n.node_id)
+        }
+      })
+      
+      // Find links between loaded nodes
+      const candidateLinks = []
+      for (const nodeId of this._loadedNodeIds) {
+        const outgoing = this._linksBySource.get(nodeId) || []
+        candidateLinks.push(...outgoing.filter(link => this._loadedNodeIds.has(link.target)))
+      }
+      
+      // Sort and limit links
+      const sortedLinks = candidateLinks
+        .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
+        .slice(0, maxLinks)
+      
+      // Update loaded links (remove duplicates)
+      const existingLinkIds = new Set(this._loadedLinks.map(l => `${l.source}-${l.target}`))
+      const newLinks = sortedLinks.filter(l => !existingLinkIds.has(`${l.source}-${l.target}`))
+      this._loadedLinks.push(...newLinks)
+    }
+    
+    getCurrentData() {
+      return {
+        nodes: this._loadedNodes,
+        links: this._loadedLinks,
+        metadata: this.metadata,
+        qParams: this.qParams,
+        _isOptimized: true,
+        _originalCounts: { nodes: this._allNodes.length, links: this._allLinks.length }
+      }
+    }
+  }
+
+  // NEW: Graph optimization utilities (now works with ChunkedGraphLoader)
+  async function optimizeGraphData(data, options = {}) {
+    // If data is a ChunkedGraphLoader, load initial data
+    if (data instanceof ChunkedGraphLoader) {
+      const nodes = await data.loadInitialNodes(options.maxNodes || 1000, options.sortBy || 'influence')
+      const nodeIds = new Set(nodes.map(n => n.node_id))
+      const links = await data.loadLinksForNodes(nodeIds, options.maxLinks || 2000)
+      
+      return data.getCurrentData()
+    }
+    
+    // If data is already chunked, return as-is
+    if (data instanceof ChunkedGraphData) {
+      return data.getCurrentData()
+    }
+    
+    // Fallback: Create chunked manager and load initial chunk
+    const chunkedData = new ChunkedGraphData(data)
+    return chunkedData.loadInitialChunk(
+      options.maxNodes || 1000,
+      options.maxLinks || 2000,
+      options.sortBy || 'influence',
+      options.clickedNodeId
+    )
+  }
+
+  // NEW: Load top links for a specific node (now works with chunked data)
+  async function loadNodeNeighborhood(originalData, nodeId, topLinksCount = 20) {
+    // If originalData is a ChunkedGraphLoader instance, use its method
+    if (originalData instanceof ChunkedGraphLoader) {
+      return await originalData.loadNodeNeighborhood(nodeId, topLinksCount)
+    }
+    
+    // If originalData is a ChunkedGraphData instance, use its method
+    if (originalData instanceof ChunkedGraphData) {
+      const result = originalData.loadNodeNeighborhood(nodeId, topLinksCount)
+      return {
+        nodes: result.nodes,
+        links: result.links,
+        centerNodeId: nodeId,
+        totalAvailableLinks: result.links.length,
+        incomingCount: result.links.filter(l => l.target === nodeId).length,
+        outgoingCount: result.links.filter(l => l.source === nodeId).length
+      }
+    }
+    
+    // Fallback to original implementation for non-chunked data
+    const { nodes, links } = originalData
+    
+    // Separate incoming and outgoing links
+    const incomingLinks = links.filter(link => link.target === nodeId)
+    const outgoingLinks = links.filter(link => link.source === nodeId)
+    
+    // Get top incoming links (sorted by absolute weight, descending)
+    const topIncoming = incomingLinks
+      .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
+      .slice(0, topLinksCount) 
+    
+    // Get top outgoing links (sorted by absolute weight, descending)
+    const topOutgoing = outgoingLinks
+      .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
+      .slice(0, topLinksCount)
+    
+    // Combine top incoming and outgoing links
+    const topLinks = [...topIncoming, ...topOutgoing]
+    
+    // Collect all node IDs involved in these top links
+    const nodeIds = new Set([nodeId]) // Always include the center node
+    topLinks.forEach(link => {
+      nodeIds.add(link.source)
+      nodeIds.add(link.target)
+    })
+    
+    // Get the actual node objects
+    const neighborNodes = nodes.filter(n => nodeIds.has(n.node_id))
+    
+    console.log(`Loaded top ${topIncoming.length} incoming + ${topOutgoing.length} outgoing = ${topLinks.length} links for node ${nodeId} (${incomingLinks.length} incoming, ${outgoingLinks.length} outgoing available)`)
+
+    return {
+      nodes: neighborNodes,
+      links: topLinks,
+      centerNodeId: nodeId,
+      totalAvailableLinks: incomingLinks.length + outgoingLinks.length,
+      incomingCount: topIncoming.length,
+      outgoingCount: topOutgoing.length
+    }
+  }
+
+
   
   function addAxisLabel(c, xText, yText, title='', xOffset=0, yOffset=0, titleOffset=0){
     c.svg.select('.x').append('g')
@@ -410,6 +773,12 @@ window.util = (function () {
     nameToPrettyPrint,
     params,
     getFile,
+    getGraphDataStreaming,
+    clearGraphCache,
+    ChunkedGraphData,
+    ChunkedGraphLoader,
+    optimizeGraphData,
+    loadNodeNeighborhood,
     addAxisLabel,
     ggPlot,
     ggPlotUpdate,

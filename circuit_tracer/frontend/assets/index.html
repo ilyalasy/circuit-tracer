@@ -138,6 +138,60 @@ window.init = async function(){
       .text(parseFloat(visState.pruningThreshold).toFixed(2))
   }
 
+  // Add graph optimization controls
+  var optimizationContainer = controlsContainer.append('div.optimization-container')
+    .style('display', 'flex')
+    .style('align-items', 'center')
+    .style('gap', '8px')
+    .style('margin-left', '20px')
+
+  // Max nodes control
+  optimizationContainer.append('span').text('Max Nodes:')
+  var maxNodesInput = optimizationContainer.append('input')
+    .attr('type', 'number')
+    .attr('min', 100)
+    .attr('max', 10000)
+    .attr('step', 100)
+    .attr('value', util.params.get('maxNodes') || 1000)
+    .style('width', '80px')
+    .on('input', function() {
+      util.params.set('maxNodes', this.value)
+      debouncedRender()
+    })
+
+  // Max links control
+  optimizationContainer.append('span').text('Max Links:').style('margin-left', '10px')
+  var maxLinksInput = optimizationContainer.append('input')
+    .attr('type', 'number')
+    .attr('min', 100)
+    .attr('max', 20000)
+    .attr('step', 100)
+    .attr('value', util.params.get('maxLinks') || 2000)
+    .style('width', '80px')
+    .on('input', function() {
+      util.params.set('maxLinks', this.value)
+      debouncedRender()
+    })
+
+  // Progress indicator
+  var progressContainer = navSel.append('div.progress-container')
+    .style('display', 'none')
+    .style('align-items', 'center')
+    .style('gap', '10px')
+  
+  progressContainer.append('span').text('Loading...')
+  var progressBar = progressContainer.append('div.progress-bar')
+    .style('width', '200px')
+    .style('height', '4px')
+    .style('background', '#eee')
+    .style('border-radius', '2px')
+    .append('div.progress-fill')
+    .style('height', '100%')
+    .style('background', '#007bff')
+    .style('border-radius', '2px')
+    .style('width', '0%')
+    .style('transition', 'width 0.3s ease')
+
   selectSel.appendMany('option', graphs)
     .text(d => {
       var scanName = util.nameToPrettyPrint[d.scan] || d.scan
@@ -146,6 +200,35 @@ window.init = async function(){
     })
     .attr('value', d => d.slug)
     .property('selected', d => d.slug === visState.slug)
+
+  // Graph status display
+  var statusContainer = navSel.append('div.status-container')
+    .style('display', 'flex')
+    .style('align-items', 'center')
+    .style('gap', '10px')
+    .style('font-size', '12px')
+    .style('color', '#666')
+    
+  var statusText = statusContainer.append('span.status-text')
+
+  // Add cache clear button
+  var clearCacheButton = navSel.append('button.clear-cache-button')
+    .text('Clear Cache')
+    .style('margin-right', '10px')
+    .style('padding', '6px 12px')
+    .style('border', '1px solid #dc3545')
+    .style('border-radius', '4px')
+    .style('background', '#dc3545')
+    .style('color', 'white')
+    .style('cursor', 'pointer')
+    .style('font-size', '12px')
+    .on('click', function() {
+      util.clearGraphCache()
+      clearCacheButton.text('Cleared!').style('background', '#28a745')
+      setTimeout(() => {
+        clearCacheButton.text('Clear Cache').style('background', '#dc3545')
+      }, 2000)
+    })
 
   // Add save button to the right
   var saveButton = navSel.append('button.save-button')
@@ -221,41 +304,157 @@ window.init = async function(){
       });
     });
 
-  function render() {
+  async function render() {
     d3.select('.cg').html('')
     
-    // Prepare options for initCg
-    var options = {
-      clickedId: visState.clickedId,
-      clickedIdCb: id => util.params.set('clickedId', id),
-      isGridsnap: visState.isGridsnap || true
-    }
+    // Show progress
+    progressContainer.style('display', 'flex')
+    progressBar.style('width', '0%')
     
-    // Only add pruningThreshold to options if it exists
-    if (visState.pruningThreshold !== undefined) {
-      options.pruningThreshold = visState.pruningThreshold
-    }
-    
-    initCg(d3.select('.cg'), visState.slug, options)
-
-    var m = graphs.find(g => g.slug == visState.slug)
-    if (!m) return
-    selectSel.at({title: m.prompt})
-    document.title = 'Attribution Graph: ' + m.prompt
-    
-    // Update the slider visibility if it exists
-    if (sliderContainer) {
-      if (m && typeof m.node_threshold === 'number') {
-        sliderContainer.style('display', 'flex')
-        
-        // Update slider value if it changed from the dropdown
-        if (visState.pruningThreshold !== undefined) {
-          sliderContainer.select('input').property('value', visState.pruningThreshold)
-          sliderContainer.select('.value-display').text(parseFloat(visState.pruningThreshold).toFixed(2))
+    try {
+      // Load graph data with streaming and optimization
+      const graphPath = `./data/${visState.slug}.json`
+      
+      // Use streaming loader with progress callback
+      const rawData = await util.getGraphDataStreaming(graphPath, (progress) => {
+        if (progress.total) {
+          const percent = Math.round((progress.loaded / progress.total) * 50) // First 50% for loading
+          progressBar.style('width', percent + '%')
         }
-      } else {
-        sliderContainer.style('display', 'none')
+      })
+      console.log("rawData")
+      console.log(rawData)
+      
+      progressBar.style('width', '60%') // Loading complete
+      
+      // Optimize the graph data
+      const maxNodes = parseInt(util.params.get('maxNodes') || 1000)
+      const maxLinks = parseInt(util.params.get('maxLinks') || 2000)
+      
+      const optimizedData = await util.optimizeGraphData(rawData, {
+        maxNodes,
+        maxLinks,
+        sortBy: 'influence',
+        clickedNodeId: visState.clickedId
+      })
+      console.log('optimizedData')
+      console.log(optimizedData)
+      
+      progressBar.style('width', '80%') // Optimization complete
+      
+      // Store the chunked loader and optimized data
+      window._chunkedGraphManager = rawData // This is now a ChunkedGraphLoader
+      window._currentGraphData = optimizedData
+      
+      // Store reference to the data object, renderAll, and visState for updates
+      let currentDataRef = null
+      let currentRenderAll = null
+      let currentVisState = null
+      
+      // Create callback function for node clicks that updates existing visualization
+      const clickedIdCallback = async (id) => {
+        util.params.set('clickedId', id)
+        
+        // When node is clicked, dynamically load its neighborhood on-demand
+        if (id) {
+                                  try {
+              // Load neighborhood data from chunked manager (much faster)
+              const updatedData = await window._chunkedGraphManager.loadNodeNeighborhood(id, 30)
+              console.log('Updated data from chunked manager:', updatedData)
+              
+              // Update current data with the expanded dataset
+              const currentData = window._currentGraphData
+              window._currentGraphData = updatedData
+              
+              console.log(`Loaded neighborhood: ${updatedData.nodes.length} total nodes (was ${currentData.nodes.length}), ${updatedData.links.length} total links (was ${currentData.links.length})`)
+            
+            // Update the data reference that the visualization components are using
+            if (currentDataRef && currentRenderAll && currentVisState) {
+              // Re-format the data to update internal structures
+              const formattedData = await utilCg.formatData(window._currentGraphData, currentVisState)
+              
+              // Update the data object in place - this updates the reference that all components share
+              Object.assign(currentDataRef, formattedData)
+              currentRenderAll.clickedId({ skipCallback: true }) // Updates clicked node highlighting without triggering callback again
+              
+              // Trigger re-render of all components that need to show the new data
+              // The renderAll functions will use the updated data reference
+              currentRenderAll.hClerpUpdate()
+              currentRenderAll.isShowAllLinks()
+              currentRenderAll.linkType()              
+              currentRenderAll.pinnedIds()
+              currentRenderAll.features()
+              currentRenderAll.isSyncEnabled()
+              currentRenderAll.hoveredId()
+              if (window._currentGraphData._isOptimized) {
+                statusText.text(`Showing ${window._currentGraphData.nodes.length} nodes, ${window._currentGraphData.links.length} links (from ${window._currentGraphData._originalCounts.nodes} nodes, ${window._currentGraphData._originalCounts.links} links)`)
+              } 
+            }
+            
+          } catch (e) {
+            console.warn('Failed to load node neighborhood:', e)
+          }
+        }
       }
+      
+      // Prepare options for initCg
+      var options = {
+        clickedId: visState.clickedId,
+        clickedIdCb: clickedIdCallback,
+        isGridsnap: visState.isGridsnap || true,
+        optimizedData: window._currentGraphData // Pass the optimized data
+      }
+      
+      // Only add pruningThreshold to options if it exists
+      if (visState.pruningThreshold !== undefined) {
+        options.pruningThreshold = visState.pruningThreshold
+      }
+      
+      progressBar.style('width', '90%') // Setup complete
+      
+      // Initialize the visualization and capture references for updates
+      const cgResult = await initCg(d3.select('.cg'), visState.slug, options)
+      currentDataRef = cgResult.data
+      currentRenderAll = cgResult.renderAll
+      currentVisState = cgResult.visState
+      
+      progressBar.style('width', '100%') // Rendering complete
+      
+      // Update status display
+      if (optimizedData._isOptimized) {
+        statusText.text(`Showing ${optimizedData.nodes.length} nodes, ${optimizedData.links.length} links (from ${optimizedData._originalCounts.nodes} nodes, ${optimizedData._originalCounts.links} links)`)
+      } else {
+        statusText.text(`Showing ${optimizedData.nodes.length} nodes, ${optimizedData.links.length} links`)
+      }
+      
+      var m = graphs.find(g => g.slug == visState.slug)
+      if (!m) return
+      selectSel.at({title: m.prompt})
+      document.title = 'Attribution Graph: ' + m.prompt
+      
+      // Update the slider visibility if it exists
+      if (sliderContainer) {
+        if (m && typeof m.node_threshold === 'number') {
+          sliderContainer.style('display', 'flex')
+          
+          // Update slider value if it changed from the dropdown
+          if (visState.pruningThreshold !== undefined) {
+            sliderContainer.select('input').property('value', visState.pruningThreshold)
+            sliderContainer.select('.value-display').text(parseFloat(visState.pruningThreshold).toFixed(2))
+          }
+        } else {
+          sliderContainer.style('display', 'none')
+        }
+      }
+      
+    } catch (error) {
+      console.error('Error loading graph:', error)
+      d3.select('.cg').html('<div style="padding: 20px; color: red;">Error loading graph: ' + error.message + '</div>')
+    } finally {
+      // Hide progress after delay
+      setTimeout(() => {
+        progressContainer.style('display', 'none')
+      }, 500)
     }
   }
   render()

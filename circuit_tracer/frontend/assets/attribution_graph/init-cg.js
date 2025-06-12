@@ -1,5 +1,11 @@
-window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold} = {}){
-  var data = await util.getFile(`./graph_data/${slug}.json`)
+window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold, optimizedData} = {}){
+  // Use optimized data if provided, otherwise load from file
+  var data = optimizedData || await util.getFile(`./graph_data/${slug}.json`)
+  
+  // Store original node count if optimized
+  if (data._isOptimized) {
+    console.log(`Using optimized graph: ${data.nodes.length} nodes (was ${data._originalCounts.nodes}), ${data.links.length} links (was ${data._originalCounts.links})`)
+  }
   
   var visState = {
     pinnedIds: [],
@@ -96,8 +102,11 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
   })
 
   // set tmpClickedLink w/ strength of all the links connected the clickedNode
-  renderAll.clickedId.fns.push(() => {
-    clickedIdCb?.(visState.clickedId)
+  renderAll.clickedId.fns.push((options = {}) => {
+    // Only call the callback if not explicitly skipped (to avoid infinite loops)
+    if (!options.skipCallback) {
+      clickedIdCb?.(visState.clickedId)
+    }
 
     var node = data.nodes.idToNode[visState.clickedId]
     if (!node){
@@ -227,6 +236,9 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
   renderAll.features()
   renderAll.isSyncEnabled()
   renderAll.hoveredId()
+  
+  // Return data, renderAll, and visState for external updates
+  return { data, renderAll, visState }
 }
 
 window.init?.()
