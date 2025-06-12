@@ -9,6 +9,8 @@ import socketserver
 import threading
 from importlib.resources import files
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from .neo4j_handler import Neo4jGraphHandler
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -34,8 +36,9 @@ class ReusableTCPServer(socketserver.TCPServer):
 
 # Create handler for serving circuit graph data
 class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, frontend_dir=None, data_dir=None, **kwargs):
+    def __init__(self, *args, frontend_dir=None, data_dir=None, neo4j_uri=None, neo4j_user=None, neo4j_password=None, **kwargs):
         self.data_dir = data_dir
+        self.neo4j_handler = Neo4jGraphHandler(neo4j_uri, neo4j_user, neo4j_password) if neo4j_uri else None
         super().__init__(*args, directory=str(frontend_dir), **kwargs)
 
     def log_message(self, format, *args):
@@ -72,11 +75,15 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
 
         # Handle data and graph_data requests from local storage
         if self.path.startswith(("/data/", "/graph_data/")):
+            # Parse URL and query parameters            
+            parsed = urlparse(self.path)
+            query_params = parse_qs(parsed.query)
+            
             # Extract the file path from the URL
             if self.path.startswith("/data/"):
-                rel_path = self.path[len("/data/") :].split("?")[0]
+                rel_path = parsed.path[len("/data/") :]
             else:  # /graph_data/
-                rel_path = self.path[len("/graph_data/") :].split("?")[0]
+                rel_path = parsed.path[len("/graph_data/") :]
 
             # Properly join paths to handle missing slashes
             local_path = os.path.join(self.data_dir, rel_path)
@@ -85,6 +92,14 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
                 f"Rewritten path to {local_path}. "
                 f"(self.path: {self.path}; self.data_dir: {self.data_dir})"
             )
+
+            # Check if this is a chunked request
+            if 'chunk' in query_params:
+                chunk_type = query_params['chunk'][0]
+                self._serve_chunked_data(local_path, chunk_type, query_params)
+                return
+
+            # Normal full file serving
             if not os.path.exists(local_path):
                 self.send_response(404)
                 self.end_headers()
@@ -106,6 +121,56 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         super().do_GET()
+
+    def _serve_chunked_data(self, file_path, chunk_type, query_params):
+        """Serve chunked graph data using Neo4j."""
+        try:
+            # Extract slug from file path
+            slug = os.path.splitext(os.path.basename(file_path))[0]
+            
+            if not self.neo4j_handler:
+                # Load data into Neo4j if not already loaded
+                # with open(file_path, 'r') as f:
+                #     graph_data = json.load(f)
+                self.neo4j_handler.load_graph(file_path, slug)
+            
+            if chunk_type == 'metadata':
+                response = self.neo4j_handler.get_metadata(slug)
+            elif chunk_type == 'nodes':
+                offset = int(query_params.get('offset', [0])[0])
+                limit = int(query_params.get('limit', [1000])[0])
+                sort_by = query_params.get('sort_by', ['influence'])[0]
+                response = self.neo4j_handler.get_nodes(slug, offset, limit, sort_by)
+            elif chunk_type == 'links':
+                node_ids = query_params.get('node_ids', [''])[0].split(',') if query_params.get('node_ids') else []
+                limit = int(query_params.get('limit', [2000])[0])
+                response = self.neo4j_handler.get_links(slug, node_ids if node_ids[0] else None, limit)
+            elif chunk_type == 'neighborhood':
+                center_node_id = query_params.get('node_id', [''])[0]
+                max_links = int(query_params.get('max_links', [20])[0])
+                if not center_node_id:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                response = self.neo4j_handler.get_neighborhood(slug, center_node_id, max_links)
+            else:
+                self.send_response(400)
+                self.end_headers()
+                return
+            
+            # Send response
+            content = json.dumps(response).encode('utf-8')
+            
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(content))
+            self.end_headers()
+            self.wfile.write(content)
+            
+        except Exception as e:
+            logger.exception(f"Error serving chunked data: {e}")
+            self.send_response(500)
+            self.end_headers()
 
     def do_POST(self):
         if not self.path.startswith("/save_graph/"):
@@ -135,6 +200,10 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
             with open(save_path, "w") as f:
                 json.dump(graph, f, indent=2)
 
+            # Update Neo4j if available
+            if self.neo4j_handler:
+                self.neo4j_handler.load_graph(graph, slug)
+
             self.send_response(200)
             self.end_headers()
             logger.info(f"Graph saved: {save_path}")
@@ -158,6 +227,7 @@ class Server:
             logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         )
         logger.addHandler(self.log_handler)
+        logger.addHandler(logging.StreamHandler())
         logger.setLevel(logging.INFO)
         # Register shutdown with atexit
         atexit.register(self.stop)
@@ -204,13 +274,16 @@ class Server:
         return self.logs
 
 
-def serve(data_dir, frontend_dir=None, port=8032):
+def serve(data_dir, frontend_dir=None, port=8032, neo4j_uri="bolt://localhost:7687", neo4j_user=None, neo4j_password=None):
     """Start a local HTTP server in a separate thread.
 
     Args:
         data_dir: Directory for local graph data.
         frontend_dir: Directory containing frontend files. Defaults to DEFAULT_FRONTEND_DIR.
         port: Port to serve on. Defaults to 8032.
+        neo4j_uri: URI for Neo4j connection. If None, will use file-based storage.
+        neo4j_user: Neo4j username.
+        neo4j_password: Neo4j password.
 
     Returns:
         Server object with a stop() method to shut down the server.
@@ -226,7 +299,14 @@ def serve(data_dir, frontend_dir=None, port=8032):
     logger.info(f"Serving files from: {frontend_dir}")
 
     # Create a partially applied handler class with configured directories
-    handler = functools.partial(CircuitGraphHandler, frontend_dir=frontend_dir, data_dir=data_dir)
+    handler = functools.partial(
+        CircuitGraphHandler,
+        frontend_dir=frontend_dir,
+        data_dir=data_dir,
+        neo4j_uri=neo4j_uri,
+        neo4j_user=neo4j_user,
+        neo4j_password=neo4j_password
+    )
 
     httpd = ReusableTCPServer(("", port), handler)
 
@@ -237,5 +317,7 @@ def serve(data_dir, frontend_dir=None, port=8032):
     logger.info(f"Serving at http://localhost:{port}")
     logger.info(f"Serving files from: {frontend_dir}")
     logger.info(f"Serving data from: {data_dir}")
+    if neo4j_uri:
+        logger.info(f"Using Neo4j at: {neo4j_uri}")
 
     return Server(httpd, server_thread)
