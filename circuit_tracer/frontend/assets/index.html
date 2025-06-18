@@ -37,7 +37,7 @@
 
 <script>
 window.init = async function(){
-  window.isLocalServing = false;
+  window.isLocalServing = true;
   var {graphs} = await util.getFile('./data/graph-metadata.json', false)
 
   window.visState = window.visState || {
@@ -108,7 +108,7 @@ window.init = async function(){
   // Create debounced render function
   var debouncedRender = util.debounce(render, 300)
   
-  // Add slider with label only if the graph has node_threshold
+  // Slider container will be created dynamically in render function
   var sliderContainer
   if (currentGraph && typeof currentGraph.node_threshold === 'number') {
     sliderContainer = controlsContainer.append('div.slider-container')
