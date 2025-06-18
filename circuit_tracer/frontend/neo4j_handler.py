@@ -43,8 +43,7 @@ class Neo4jGraphHandler:
             
             if existing_metadata:
                 logger.info(f"Graph {slug} already loaded at {existing_metadata['loaded_at']} from {existing_metadata['file_path']}")
-                return                        
-                        
+                return
             # Load and create nodes
             result = session.run("""
                 CALL apoc.load.json($file_path)
@@ -54,10 +53,18 @@ class Neo4jGraphHandler:
                 CREATE (n:Node {node_id: node.node_id})
                 SET n += {
                     slug: $slug,
+                    feature: node.feature,
+                    layer: node.layer,
+                    ctx_idx: node.ctx_idx,
                     feature_type: node.feature_type,
+                    token_prob: node.token_prob,
+                    is_target_logit: node.is_target_logit,
+                    run_idx: node.run_idx,
+                    reverse_ctx_idx: node.reverse_ctx_idx,
+                    jsNodeId: node.jsNodeId,
+                    clerp: node.clerp,
                     influence: node.influence,
-                    activation: node.activation,
-                    properties: node.properties
+                    activation: node.activation
                 }                
             """, {
                 'file_path': relative_path,
@@ -140,7 +147,7 @@ class Neo4jGraphHandler:
                 'qParams': json.loads(metadata_node.get('qParams', {})),
                 'node_count': counts_record['node_count'] if counts_record else 0,
                 'link_count': counts_record['link_count'] if counts_record else 0,
-                'loaded_at': metadata_node.get('loaded_at'),
+                'loaded_at': metadata_node.get('loaded_at').isoformat(),
                 'file_path': metadata_node.get('file_path')
             }
     
@@ -186,7 +193,7 @@ class Neo4jGraphHandler:
             """, {'slug': slug}).single()['count']
             
             return {
-                'nodes': const_nodes + other_nodes,
+                'nodes': [node['n'] for node in const_nodes + other_nodes],
                 'total_count': total_count,
                 'offset': offset,
                 'limit': limit
@@ -244,7 +251,7 @@ class Neo4jGraphHandler:
                 ORDER BY r_in.weight DESC
                 LIMIT $max_links
                 WITH collect(DISTINCT 
-                    { link:r_in, 
+                    { link:{source:startNode(r_in).node_id, target:endNode(r_in).node_id, weight:r_in.weight}, 
                         node: startNode(r_in)
                     }) AS incoming
                 RETURN { incoming: incoming } AS result
@@ -254,7 +261,7 @@ class Neo4jGraphHandler:
                 ORDER BY r_out.weight DESC
                 LIMIT $max_links
                 WITH collect(DISTINCT 
-                    { link:r_out, 
+                    { link:{source:startNode(r_out).node_id, target:endNode(r_out).node_id, weight:r_out.weight}, 
                         node: endNode(r_out)
                     }) AS outgoing
                 RETURN { outgoing: outgoing } AS result
@@ -283,8 +290,10 @@ class Neo4jGraphHandler:
                     'target': link.get('target'),
                     'weight': link.get('weight'),
                     'properties': link.get('properties', {})
-                })                
+                })
             
+            logger.info(f"Nodes: {nodes}")
+            logger.info(f"Links: {links}")  
             return {
                 'nodes': list(nodes),
                 'links': links,

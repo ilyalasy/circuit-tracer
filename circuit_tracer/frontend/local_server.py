@@ -38,7 +38,7 @@ class ReusableTCPServer(socketserver.TCPServer):
 class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, frontend_dir=None, data_dir=None, neo4j_uri=None, neo4j_user=None, neo4j_password=None, **kwargs):
         self.data_dir = data_dir
-        self.neo4j_handler = Neo4jGraphHandler(neo4j_uri, neo4j_user, neo4j_password) if neo4j_uri else None
+        self.neo4j_handler: Neo4jGraphHandler | None = Neo4jGraphHandler(neo4j_uri, neo4j_user, neo4j_password) if neo4j_uri else None
         super().__init__(*args, directory=str(frontend_dir), **kwargs)
 
     def log_message(self, format, *args):
@@ -128,11 +128,16 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
             # Extract slug from file path
             slug = os.path.splitext(os.path.basename(file_path))[0]
             
-            if not self.neo4j_handler:
-                # Load data into Neo4j if not already loaded
-                # with open(file_path, 'r') as f:
-                #     graph_data = json.load(f)
+            if self.neo4j_handler is None:
+                raise ValueError("Neo4j handler is not initialized")
+            
+            # Check if graph is already loaded, only load if not present
+            metadata = self.neo4j_handler.get_metadata(slug)
+            if not metadata.get('exists', False):
+                logger.info(f"Graph {slug} not found in Neo4j, loading from {file_path}")
                 self.neo4j_handler.load_graph(file_path, slug)
+            else:
+                logger.info(f"Graph {slug} already exists in Neo4j, skipping load")
             
             if chunk_type == 'metadata':
                 response = self.neo4j_handler.get_metadata(slug)
@@ -144,7 +149,7 @@ class CircuitGraphHandler(http.server.SimpleHTTPRequestHandler):
             elif chunk_type == 'links':
                 node_ids = query_params.get('node_ids', [''])[0].split(',') if query_params.get('node_ids') else []
                 limit = int(query_params.get('limit', [2000])[0])
-                response = self.neo4j_handler.get_links(slug, node_ids if node_ids[0] else None, limit)
+                response = self.neo4j_handler.get_links(slug, node_ids if len(node_ids) > 0 else None, limit)
             elif chunk_type == 'neighborhood':
                 center_node_id = query_params.get('node_id', [''])[0]
                 max_links = int(query_params.get('max_links', [20])[0])
